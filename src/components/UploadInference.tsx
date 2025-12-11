@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { memo, useMemo, useState, useDeferredValue, useCallback, useRef } from "react";
 import { AsyncDuckDB, AsyncDuckDBConnection, ConsoleLogger } from "@duckdb/duckdb-wasm";
 import { CanonicalField, SchemaInferenceResult } from "@/lib/contracts";
 import {
@@ -21,6 +21,11 @@ const bundleOverride = {
 
 const MAX_COLUMNS = 200;
 const MAX_STRING_LEN = 120;
+const CACHE_PREFIX = "upload-cache-v1";
+const LLM_ENABLED =
+  typeof process !== "undefined"
+    ? process.env.NEXT_PUBLIC_ENABLE_LLM !== "false"
+    : true;
 
 type Mapping = {
   originalName: string;
@@ -43,6 +48,13 @@ type AggregateResult = {
   anomalies: Awaited<ReturnType<typeof getAnomalies>> | null;
 };
 
+type CachePayload = {
+  result: InferenceResult;
+  agg?: AggregateResult | null;
+  insights?: string[] | null;
+  lastRefreshed?: string | null;
+};
+
 type ChatMessage = {
   role: "user" | "assistant";
   content: string;
@@ -53,16 +65,39 @@ export function UploadInference() {
   const [db, setDb] = useState<AsyncDuckDB | null>(null);
   const [conn, setConn] = useState<AsyncDuckDBConnection | null>(null);
   const [loading, setLoading] = useState(false);
+  const [aggLoading, setAggLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<InferenceResult | null>(null);
   const [agg, setAgg] = useState<AggregateResult | null>(null);
+  const [aggView, setAggView] = useState<AggregateResult | null>(null);
   const [insights, setInsights] = useState<string[] | null>(null);
   const [insightsLoading, setInsightsLoading] = useState(false);
   const [insightsError, setInsightsError] = useState<string | null>(null);
   const [chatInput, setChatInput] = useState("");
+  const deferredChatInput = useDeferredValue(chatInput);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatLoading, setChatLoading] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
+  const [lastRefreshed, setLastRefreshed] = useState<string | null>(null);
+  const [fileHash, setFileHash] = useState<string | null>(null);
+  const [cacheHit, setCacheHit] = useState(false);
+  const mappedColumns = useMemo(() => result?.schema.columns.filter((c) => c.canonicalName) ?? [], [result]);
+  const mappedDistinctEntries = useMemo(() => {
+    if (!result?.schema.distinctCounts) return [];
+    const mappedNames = new Set(mappedColumns.map((c) => c.originalName));
+    return Object.entries(result.schema.distinctCounts)
+      .filter(([name]) => mappedNames.has(name))
+      .sort((a, b) => Number(b[1] ?? 0) - Number(a[1] ?? 0))
+      .slice(0, 8);
+  }, [result, mappedColumns]);
+  const productsFullRef = useRef<any[] | null>(null);
+  const channelsFullRef = useRef<any[] | null>(null);
+  const geoFullRef = useRef<any[] | null>(null);
+  const anomaliesFullRef = useRef<any[] | null>(null);
+  const previewJson = useMemo(
+    () => (result ? JSON.stringify(result.previewRows, null, 2) : ""),
+    [result],
+  );
 
   const ensureDb = useMemo(
     () => async () => {
@@ -95,8 +130,23 @@ export function UploadInference() {
     setChatInput("");
     setLoading(true);
     try {
+      const bufArray = await file.arrayBuffer();
+      const buf = new Uint8Array(bufArray);
+      const hash = await sha256Hex(bufArray);
+      setFileHash(hash);
+      const cached = loadCache(hash);
+      if (cached) {
+        setCacheHit(true);
+        setResult(cached.result);
+        setAgg(cached.agg ?? null);
+        setInsights(cached.insights ?? null);
+        setLastRefreshed(cached.lastRefreshed ?? null);
+        setLoading(false);
+        return;
+      }
+      setCacheHit(false);
+
       const { db: duck, conn: connection } = await ensureDb();
-      const buf = new Uint8Array(await file.arrayBuffer());
       const filename = `upload_${Date.now()}.csv`;
       await duck.registerFileBuffer(filename, buf);
 
@@ -128,8 +178,9 @@ export function UploadInference() {
       const previewRows = JSON.parse(JSON.stringify(rawPreviewRows, bigintReplacer)).map((row: Record<string, unknown>) => {
         const next: Record<string, unknown> = {};
         for (const [k, v] of Object.entries(row)) {
-          if (tsColForPreview && k === tsColForPreview && typeof v === "number") {
-            next[k] = new Date(v as number).toISOString();
+          if (tsColForPreview && k === tsColForPreview && (typeof v === "number" || typeof v === "string")) {
+            const iso = safeToIso(v);
+            next[k] = iso ?? v;
           } else if (typeof v === "string" && v.length > MAX_STRING_LEN) {
             next[k] = v.slice(0, MAX_STRING_LEN) + "…";
           } else {
@@ -144,17 +195,17 @@ export function UploadInference() {
       if (tsMapping) {
         const tsCol = tsMapping.originalName;
         const dateRes = await connection.query(
-          `SELECT MIN(${tsCol}) as min_date, MAX(${tsCol}) as max_date FROM data;`,
+          `SELECT MIN(${quoteIdent(tsCol)}) as min_date, MAX(${quoteIdent(tsCol)}) as max_date FROM data;`,
         );
         const [row] = dateRes.toArray() as { min_date?: string; max_date?: string }[];
-        minDate = row?.min_date ? new Date(row.min_date).toISOString() : undefined;
-        maxDate = row?.max_date ? new Date(row.max_date).toISOString() : undefined;
+        minDate = row?.min_date ? safeToIso(row.min_date) ?? undefined : undefined;
+        maxDate = row?.max_date ? safeToIso(row.max_date) ?? undefined : undefined;
       }
 
       const distinctCounts: Record<string, number> = {};
       for (const m of mappings.filter((m) => m.canonicalName)) {
         const col = m.originalName;
-        const res = await connection.query(`SELECT COUNT(DISTINCT ${col}) as c FROM data;`);
+        const res = await connection.query(`SELECT COUNT(DISTINCT ${quoteIdent(col)}) as c FROM data;`);
         distinctCounts[col] = (res.toArray()[0] as { c: number }).c;
       }
 
@@ -173,6 +224,7 @@ export function UploadInference() {
 
       console.info("Ingestion summary", { rows: rowCount, columns: columns.length, mappings });
       setResult({ schema: response, previewRows });
+      saveCache(hash, { result: { schema: response, previewRows } });
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Upload failed";
       setError(msg);
@@ -180,10 +232,10 @@ export function UploadInference() {
       setLoading(false);
     }
   };
-
-  const runAggregates = async () => {
+const runAggregates = async () => {
     if (!conn || !result) return;
     try {
+      setAggLoading(true);
       setError(null);
       const map = buildColumnMap(result.schema);
       await materializeCleanedView(conn, map);
@@ -194,7 +246,7 @@ export function UploadInference() {
       const channels = await getChannels(conn);
       const anomalies = await getAnomalies(conn);
 
-      const toIso = (v: any) => (typeof v === "number" ? new Date(v).toISOString() : v);
+      const toIso = (v: any) => safeToIso(v) ?? v;
       const display: AggregateResult = {
         summary: summary
           ? {
@@ -215,20 +267,50 @@ export function UploadInference() {
         anomalies: anomalies?.map((a: any) => ({ ...a, date: toIso(a.date) })) ?? anomalies,
       };
 
-      setAgg(display);
-      await fetchInsights(display);
+      productsFullRef.current = products as any;
+      channelsFullRef.current = channels as any;
+      geoFullRef.current = geo as any;
+      anomaliesFullRef.current = anomalies as any;
+      const view: AggregateResult = {
+        summary: display.summary,
+        timeseries: display.timeseries,
+        products: products?.slice(0, 50) as any,
+        geo: geo?.slice(0, 50) as any,
+        channels: channels?.slice(0, 50) as any,
+        anomalies: anomalies?.slice(0, 50) as any,
+      };
+      setAgg(view);
+      setAggView(view);
+      const refreshed = new Date().toISOString();
+      setLastRefreshed(refreshed);
+      if (fileHash) {
+        saveCache(fileHash, { result, agg: view, insights, lastRefreshed: refreshed });
+      }
+      await fetchInsights(view);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Aggregations failed";
       setError(msg);
+    } finally {
+      setAggLoading(false);
     }
   };
-
-  const fetchInsights = async (context: AggregateResult) => {
+const fetchInsights = async (context: AggregateResult) => {
+    if (!LLM_ENABLED) {
+      setInsightsError("LLM disabled (set NEXT_PUBLIC_ENABLE_LLM=true to enable).");
+      setInsights([]);
+      return;
+    }
     try {
       setInsightsLoading(true);
       setInsightsError(null);
       setInsights(null);
       const payload = buildInsightPayload(context);
+      const payloadStr = JSON.stringify(payload);
+      if (payloadStr.length > 4000) {
+        setInsightsError("Context too large, skipped insights to save tokens.");
+        setInsights([]);
+        return;
+      }
       const res = await fetch("/api/insights", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -246,21 +328,23 @@ export function UploadInference() {
       setInsightsLoading(false);
     }
   };
-
-  const runChat = async () => {
-    if (!conn || !agg || !agg.summary || !chatInput.trim()) return;
+const runChat = async () => {
+    if (!conn || !aggView || !aggView.summary || !chatInput.trim()) return;
     setChatError(null);
     setChatLoading(true);
     try {
+      if (!LLM_ENABLED) {
+        throw new Error("LLM disabled (set NEXT_PUBLIC_ENABLE_LLM=true to enable).");
+      }
       await materializeCleanedView(conn, buildColumnMap(result!.schema));
-      const templateResult = await routeChatQuestion(conn, agg, chatInput.trim());
+      const templateResult = await routeChatQuestion(conn, aggView, chatInput.trim());
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           question: chatInput.trim(),
           template: templateResult.template,
-          summary: agg.summary,
+          summary: aggView.summary,
           table: templateResult.table,
         }),
       });
@@ -279,109 +363,145 @@ export function UploadInference() {
       setChatLoading(false);
     }
   };
-
   return (
-    <div className="space-y-4">
-      <div className="border-2 border-dashed border-gray-400 rounded p-6 text-center">
-        <input
-          type="file"
-          accept=".csv,text/csv"
-          onChange={(e) => handleFile(e.target.files?.[0] ?? null)}
-          className="mx-auto text-sm"
-        />
-        <p className="text-sm text-gray-500 mt-2">Drop a CSV to infer schema locally (WASM).</p>
+    <div className="space-y-5">
+      <div className="border-2 border-dashed border-slate-200 rounded-xl p-6 text-center shadow-sm bg-white">
+        <div className="flex flex-col items-center gap-3">
+          <input
+            id="file-input"
+            type="file"
+            accept=".csv,text/csv"
+            onChange={(e) => handleFile(e.target.files?.[0] ?? null)}
+            className="hidden"
+          />
+          <label
+            htmlFor="file-input"
+            className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow hover:bg-indigo-700 cursor-pointer"
+          >
+            Choose CSV
+          </label>
+          <p className="text-sm text-gray-500">Drop a CSV or click the button above to load locally (WASM).</p>
+          {cacheHit && (
+            <p className="text-xs text-green-600">Loaded from cache. Click Run to refresh aggregates.</p>
+          )}
+        </div>
       </div>
 
-      {loading && <p className="text-sm text-blue-600">Processing CSV...</p>}
-      {error && <p className="text-sm text-red-600">Error: {error}</p>}
+      {loading && <p className="text-sm text-emerald-600">Processing CSV...</p>}
+      {error && <p className="text-sm text-rose-600">Error: {error}</p>}
 
       {result && (
         <div className="space-y-3">
-          <div className="border rounded p-3 space-y-1">
-            <h3 className="font-semibold">Summary</h3>
+          <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-1 shadow-sm">
+            <h3 className="font-semibold text-slate-900">Summary</h3>
             <p className="text-sm">Rows: {result.schema.rowCount}</p>
             <p className="text-sm">
-              Date range: {result.schema.minDate ?? "n/a"} → {result.schema.maxDate ?? "n/a"}
+              Date range: {formatDateDisplay(result.schema.minDate)} → {formatDateDisplay(result.schema.maxDate)}
             </p>
-            {Object.keys(result.schema.distinctCounts ?? {}).length > 0 && (
-              <div className="text-sm text-gray-700">
-                Distinct counts: {" "}
-                {Object.entries(result.schema.distinctCounts ?? {})
-                  .map(([col, cnt]) => `${col}: ${cnt}`)
-                  .join(", " )}
+            {mappedDistinctEntries.length > 0 && (
+              <div className="text-sm text-gray-700 space-y-0.5">
+                <div className="font-semibold text-xs text-gray-600">Distinct (mapped fields)</div>
+                <div className="max-h-24 overflow-auto pr-1">
+                  {mappedDistinctEntries.map(([col, cnt]) => (
+                    <div key={col} className="flex justify-between text-xs text-gray-700">
+                      <span>{col}</span>
+                      <span>{cnt as number}</span>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
+            {lastRefreshed && <p className="text-xs text-gray-500">Last refreshed: {lastRefreshed}</p>}
           </div>
 
-          <div className="border rounded p-3">
-            <h3 className="font-semibold mb-2">Column Mapping</h3>
-            <div className="space-y-1 text-sm">
-              {result.schema.columns.map((col) => (
+          <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="font-semibold text-slate-900">Column Mapping</h3>
+              <span className="text-xs text-gray-500">
+                Mapped {mappedColumns.length} of {result.schema.columns.length}
+              </span>
+            </div>
+            <div className="space-y-1 text-sm max-h-56 overflow-auto pr-1">
+              {mappedColumns.map((col) => (
                 <div key={col.originalName} className="flex justify-between">
                   <span>{col.originalName}</span>
                   <span className="text-gray-600">
-                    {col.canonicalName ?? "unmapped"} ({Math.round(col.confidence * 100)}%)
+                    {col.canonicalName} ({Math.round(col.confidence * 100)}%)
                   </span>
                 </div>
               ))}
+              {mappedColumns.length === 0 && (
+                <p className="text-sm text-gray-600">No columns mapped.</p>
+              )}
             </div>
           </div>
 
-          <div className="border rounded p-3">
-            <h3 className="font-semibold mb-2">Preview (first 20 rows)</h3>
-            <pre className="overflow-auto text-xs bg-gray-50 p-2 rounded">
-              {JSON.stringify(result.previewRows, null, 2)}
+          <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+            <h3 className="font-semibold text-slate-900 mb-2">Preview (first 20 rows)</h3>
+            <pre className="overflow-auto max-h-72 text-xs bg-slate-50 border border-slate-200 p-3 rounded-lg text-slate-900">
+              {previewJson}
             </pre>
           </div>
 
-          <div className="border rounded p-3 space-y-3">
+          <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 shadow-sm">
             <div className="flex items-center justify-between">
               <div className="space-y-1">
-                <h3 className="font-semibold">Dashboard</h3>
+                <h3 className="font-semibold text-slate-900">Dashboard</h3>
                 <p className="text-xs text-gray-500">Click Run to compute aggregates</p>
               </div>
               <button
                 onClick={runAggregates}
-                className="rounded bg-indigo-600 px-3 py-1 text-sm font-medium text-white hover:bg-indigo-700 disabled:bg-gray-400"
-                disabled={loading}
+                className="rounded-lg bg-gradient-to-r from-indigo-500 to-cyan-500 px-4 py-2 text-sm font-medium text-white shadow-lg hover:brightness-110 disabled:from-gray-400 disabled:to-gray-400"
+                disabled={loading || aggLoading}
               >
-                Run
+                {aggLoading ? "Running..." : "Run"}
               </button>
             </div>
 
-            {!agg && <p className="text-sm text-gray-600">No aggregates yet.</p>}
+            {!aggView && !aggLoading && <p className="text-sm text-gray-600">No aggregates yet.</p>}
+            {aggLoading && (
+              <div className="grid gap-3 md:grid-cols-2 animate-pulse">
+                {[...Array(4)].map((_, i) => (
+                  <div key={i} className="rounded border p-3 space-y-2">
+                    <div className="h-4 bg-gray-200 rounded w-1/2" />
+                    <div className="h-3 bg-gray-200 rounded w-3/4" />
+                    <div className="h-3 bg-gray-200 rounded w-2/3" />
+                  </div>
+                ))}
+              </div>
+            )}
 
-            {agg && (
+            {aggView && (
               <div className="grid gap-3 md:grid-cols-2">
                 <div className="rounded border p-3 space-y-1">
                   <h4 className="text-sm font-semibold">Summary</h4>
-                  <p className="text-sm text-gray-800">Revenue: {formatCurrency(agg.summary?.totalRevenue)}</p>
-                  <p className="text-sm text-gray-800">Units: {agg.summary?.totalQuantity ?? "n/a"}</p>
+                  <p className="text-sm text-gray-800">Revenue: {formatCurrency(aggView.summary?.totalRevenue)}</p>
+                  <p className="text-sm text-gray-800">Units: {aggView.summary?.totalQuantity ?? "n/a"}</p>
                   <p className="text-xs text-gray-600">
-                    Date range: {agg.summary?.minDate ?? "n/a"} → {agg.summary?.maxDate ?? "n/a"}
+                    Date range: {aggView.summary?.minDate ?? "n/a"} → {aggView.summary?.maxDate ?? "n/a"}
                   </p>
                   <p className="text-xs text-gray-600">
-                    MoM: {formatPct(agg.summary?.momGrowthPct)} • YoY: {formatPct(agg.summary?.yoyGrowthPct)}
+                    MoM: {formatPct(aggView.summary?.momGrowthPct)} • YoY: {formatPct(aggView.summary?.yoyGrowthPct)}
                   </p>
                 </div>
 
                 <div className="rounded border p-3 space-y-2">
                   <h4 className="text-sm font-semibold">Timeseries (daily)</h4>
-                  <div className="space-y-1 text-xs text-gray-800 max-h-32 overflow-auto">
-                    {(agg.timeseries?.daily ?? []).slice(0, 7).map((d, i) => (
+                  <div className="space-y-1 text-xs text-gray-800 max-h-40 overflow-auto">
+                    {(aggView.timeseries?.daily ?? []).slice(0, 7).map((d, i) => (
                       <div key={i} className="flex justify-between">
                         <span>{d.date as string}</span>
                         <span>{formatCurrency(d.revenue)}</span>
                       </div>
                     ))}
-                    {(agg.timeseries?.daily?.length ?? 0) === 0 && <p>No dates.</p>}
+                    {(aggView.timeseries?.daily?.length ?? 0) === 0 && <p>No dates.</p>}
                   </div>
                 </div>
 
                 <div className="rounded border p-3 space-y-2">
                   <h4 className="text-sm font-semibold">Top Products</h4>
-                  <div className="space-y-1 text-xs text-gray-800">
-                    {agg.products?.map((p, i) => (
+                  <div className="space-y-1 text-xs text-gray-800 max-h-64 overflow-auto pr-1">
+                    {aggView.products?.map((p, i) => (
                       <div key={i}>
                         <div className="flex justify-between">
                           <span>{p.product}</span>
@@ -390,103 +510,112 @@ export function UploadInference() {
                         <div className="h-2 rounded bg-gray-100">
                           <div
                             className="h-2 rounded bg-indigo-500"
-                            style={{ width: barWidth(p.revenue, agg.products) }}
+                            style={{ width: barWidth(p.revenue, aggView?.products ?? []) }}
                           />
                         </div>
                       </div>
                     ))}
-                    {(!agg.products || agg.products.length === 0) && <p>No products.</p>}
+                    {(!aggView.products || aggView.products.length === 0) && <p>No products.</p>}
                   </div>
                 </div>
 
                 <div className="rounded border p-3 space-y-2">
                   <h4 className="text-sm font-semibold">Channels</h4>
-                  <div className="space-y-1 text-xs text-gray-800">
-                    {agg.channels?.map((c, i) => (
+                  <div className="space-y-1 text-xs text-gray-800 max-h-56 overflow-auto pr-1">
+                    {aggView.channels?.map((c, i) => (
                       <div key={i} className="flex justify-between">
                         <span>{c.channel ?? "(unknown)"}</span>
                         <span>{formatCurrency(c.revenue)}</span>
                       </div>
                     ))}
-                    {(!agg.channels || agg.channels.length === 0) && <p>No channels.</p>}
+                    {(!aggView.channels || aggView.channels.length === 0) && <p>No channels.</p>}
                   </div>
                 </div>
 
                 <div className="rounded border p-3 space-y-2">
                   <h4 className="text-sm font-semibold">Geo</h4>
                   <div className="space-y-1 text-xs text-gray-800 max-h-28 overflow-auto">
-                    {agg.geo?.map((g, i) => (
+                    {aggView.geo?.map((g, i) => (
                       <div key={i} className="flex justify-between">
                         <span>{[g.city, g.state].filter(Boolean).join(', ') || '(unknown)'}</span>
                         <span>{formatCurrency(g.revenue)}</span>
                       </div>
                     ))}
-                    {(!agg.geo || agg.geo.length === 0) && <p>No geo.</p>}
+                    {(!aggView.geo || aggView.geo.length === 0) && <p>No geo.</p>}
                   </div>
                 </div>
 
-                <div className="rounded border p-3 space-y-1">
-                  <h4 className="text-sm font-semibold">Anomalies</h4>
-                  <div className="space-y-1 text-xs text-gray-800">
-                    {agg.anomalies?.map((a, i) => (
-                      <div key={i} className="flex justify-between">
-                        <span>{a.date as string}</span>
-                        <span>{formatCurrency(a.revenue)} (z={a.zscore?.toFixed?.(2) ?? 'n/a'})</span>
-                      </div>
-                    ))}
-                    {(!agg.anomalies || agg.anomalies.length === 0) && <p>No anomalies.</p>}
+                <div className="rounded border p-3 space-y-2">
+                  <div className="flex items-start justify-between">
+                    <h4 className="text-sm font-semibold">Anomalies</h4>
+                    <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-700">
+                      Spikes & dips
+                    </span>
+                  </div>
+                  <p className="text-xs text-gray-600">
+                    Days where revenue was far from the usual daily average. Positive z = spike; negative z = dip.
+                  </p>
+                  <div className="space-y-2 text-xs text-gray-800">
+                    {aggView.anomalies?.map((a, i) => {
+                      const z = a.zscore ?? 0;
+                      const isHigh = z >= 0;
+                      return (
+                        <div
+                          key={i}
+                          className="flex items-center justify-between rounded-lg border border-slate-200 px-2 py-2"
+                        >
+                          <div className="space-y-0.5">
+                            <div className="text-sm text-gray-900">{a.date as string}</div>
+                            <div className="text-gray-700">
+                              {formatCurrency(a.revenue)} • z={z?.toFixed?.(2) ?? "n/a"}
+                            </div>
+                          </div>
+                          <span
+                            className={
+                              "rounded-full px-2 py-0.5 text-[10px] font-semibold " +
+                              (isHigh ? "bg-emerald-100 text-emerald-700" : "bg-rose-100 text-rose-700")
+                            }
+                          >
+                            {isHigh ? "High spike" : "Drop"}
+                          </span>
+                        </div>
+                      );
+                    })}
+                    {(!aggView.anomalies || aggView.anomalies.length === 0) && <p>No anomalies.</p>}
                   </div>
                 </div>
               </div>
             )}
           </div>
-
-          <div className="border rounded p-3 space-y-2">
+          <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 shadow-sm">
             <div className="flex items-center justify-between">
-              <h3 className="font-semibold">Insights</h3>
+              <h3 className="font-semibold text-slate-900">Insights</h3>
               {insightsLoading && <span className="text-xs text-gray-500">Generating…</span>}
             </div>
-            {insightsError && <p className="text-sm text-red-600">{insightsError}</p>}
+            {insightsError && <p className="text-sm text-rose-600">{insightsError}</p>}
             {insights && insights.length > 0 && (
-              <ul className="list-disc list-inside text-sm space-y-1">
-                {insights.map((item, idx) => (
-                  <li key={idx}>{item}</li>
-                ))}
-              </ul>
+              <div className="max-h-64 overflow-auto pr-1">
+                <ul className="list-disc list-inside text-sm space-y-1 text-slate-800">
+                  {insights.map((item, idx) => (
+                    <li key={idx}>{item}</li>
+                  ))}
+                </ul>
+              </div>
             )}
             {insights && insights.length === 0 && !insightsLoading && (
               <p className="text-sm text-gray-600">No insights returned.</p>
             )}
           </div>
 
-          <div className="border rounded p-3 space-y-2">
-            <h3 className="font-semibold">Chat</h3>
-            <div className="space-y-2">
-              <input
-                value={chatInput}
-                onChange={(e) => setChatInput(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); runChat(); } }}
-                placeholder="Ask a question (e.g., top products, channels, growth, anomalies)"
-                className="w-full rounded border px-3 py-2 text-sm"
-              />
-              <button
-                onClick={runChat}
-                className="rounded bg-indigo-600 px-3 py-1 text-sm font-medium text-white hover:bg-indigo-700 disabled:bg-gray-400"
-                disabled={chatLoading || !chatInput.trim()}
-              >
-                Ask
-              </button>
-              {chatError && <p className="text-sm text-red-600">{chatError}</p>}
-            </div>
-            <div className="space-y-2">
-              {chatMessages.map((m, idx) => (
-                <div key={idx} className="rounded border border-gray-200 bg-gray-50 p-2 text-sm">
-                  <div className="font-semibold text-gray-700">{m.role === "user" ? "You" : "AI"}</div>
-                  <div className="whitespace-pre-wrap text-gray-800">{m.content}</div>
-                </div>
-              ))}
-            </div>
-          </div>
+          <ChatPanel
+            input={chatInput}
+            deferredInput={deferredChatInput}
+            onInputChange={setChatInput}
+            onSend={runChat}
+            loading={chatLoading}
+            error={chatError}
+            messages={chatMessages}
+          />
 
 
         </div>
@@ -512,6 +641,36 @@ function barWidth(value: number | null | undefined, rows?: { revenue: number }[]
   if (max <= 0) return "0%";
   const pct = Math.round((value / max) * 100);
   return `${Math.min(100, pct)}%`;
+}
+
+function saveCache(hash: string, data: CachePayload) {
+  if (typeof window === "undefined") return;
+  try {
+    const existing = loadCache(hash);
+    const merged = { ...(existing ?? {}), ...data };
+    localStorage.setItem(`${CACHE_PREFIX}:${hash}`, JSON.stringify(merged));
+  } catch (_) {
+    // ignore cache failures
+  }
+}
+
+function loadCache(hash: string): CachePayload | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(`${CACHE_PREFIX}:${hash}`);
+    if (!raw) return null;
+    return JSON.parse(raw) as CachePayload;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function sha256Hex(buf: ArrayBuffer) {
+  const hashBuf = await crypto.subtle.digest("SHA-256", buf);
+  const bytes = new Uint8Array(hashBuf);
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 function buildInsightPayload(agg: AggregateResult) {
@@ -668,3 +827,59 @@ function inferCanonical(name: string): Mapping {
     reason: reason.join("; "),
   };
 }
+
+
+function safeToIso(v: any) {
+  if (v === null || v === undefined) return null;
+  const d = new Date(v as any);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
+
+
+function quoteIdent(name: string) {
+  return `"${name.replace(/"/g, '')}"`;
+}
+
+
+function formatDateDisplay(v: any) {
+  if (!v) return "n/a";
+  const d = new Date(v as any);
+  if (Number.isNaN(d.getTime())) return "n/a";
+  const year = d.getFullYear();
+  if (year < 1900 || year > 2100) return "n/a";
+  return d.toISOString().split("T")[0];
+}
+
+const ChatPanel = memo(function ChatPanel({ input, deferredInput, onInputChange, onSend, loading, error, messages }: { input: string; deferredInput: string; onInputChange: (v: string) => void; onSend: () => void; loading: boolean; error: string | null; messages: { role: "user" | "assistant"; content: string }[]; }) {
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 shadow-sm">
+      <h3 className="font-semibold text-slate-900">Chat</h3>
+      <div className="space-y-2">
+        <input
+          value={input}
+          onChange={(e) => onInputChange(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); onSend(); } }}
+          placeholder="Ask a question (e.g., top products, channels, growth, anomalies)"
+          className="w-full rounded border px-3 py-2 text-sm"
+        />
+        <button
+          onClick={onSend}
+          className="rounded-lg bg-gradient-to-r from-indigo-500 to-cyan-500 px-4 py-2 text-sm font-medium text-white shadow-lg hover:brightness-110 disabled:from-gray-400 disabled:to-gray-400"
+          disabled={loading || !deferredInput.trim()}
+        >
+          {loading ? "Sending..." : "Ask"}
+        </button>
+        {error && <p className="text-sm text-rose-600">{error}</p>}
+      </div>
+      <div className="space-y-2 max-h-64 overflow-auto pr-1">
+        {messages.map((m, idx) => (
+          <div key={idx} className="rounded-lg border border-slate-200 bg-white p-3 text-sm text-slate-900">
+            <div className="font-semibold text-gray-700">{m.role === "user" ? "You" : "AI"}</div>
+            <div className="whitespace-pre-wrap text-gray-800">{m.content}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+});

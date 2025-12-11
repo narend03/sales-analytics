@@ -20,25 +20,29 @@ export type ChannelRow = { channel: string; revenue: number; quantity: number };
 export type AnomalyRow = { date: string; revenue: number; zscore: number };
 
 export async function materializeCleanedView(conn: AsyncDuckDBConnection, mapping: ColumnMap) {
+  const qi = (v?: string) => (v ? `"${v.replace(/"/g, '""')}"` : "NULL");
   const dateCol = mapping.timestamp ?? mapping.date ?? mapping["original_column"];
   const priceCol = mapping.price;
   const qtyCol = mapping.quantity;
   const revenueExpr =
-    mapping.revenue ??
-    (priceCol && qtyCol ? `${priceCol}::DOUBLE * ${qtyCol}::DOUBLE` : "NULL::DOUBLE");
+    mapping.revenue
+      ? `TRY_CAST(${qi(mapping.revenue)} AS DOUBLE)`
+      : priceCol && qtyCol
+        ? `TRY_CAST(${qi(priceCol)} AS DOUBLE) * TRY_CAST(${qi(qtyCol)} AS DOUBLE)`
+        : "NULL::DOUBLE";
 
   const sql = `
     CREATE OR REPLACE VIEW cleaned AS
     SELECT
-      ${mapping.order_id ?? "NULL"} AS order_id,
-      ${mapping.product ?? "NULL"} AS product,
-      ${dateCol ?? "NULL"}::TIMESTAMP AS ts,
-      ${qtyCol ? `${qtyCol}::DOUBLE` : "NULL"} AS quantity,
-      ${priceCol ? `${priceCol}::DOUBLE` : "NULL"} AS price,
-      ${mapping.channel ?? "NULL"} AS channel,
-      ${mapping.city ?? "NULL"} AS city,
-      ${mapping.state ?? "NULL"} AS state,
-      ${mapping.zip ?? "NULL"} AS zip,
+      ${mapping.order_id ? qi(mapping.order_id) : "NULL"} AS order_id,
+      ${mapping.product ? qi(mapping.product) : "NULL"} AS product,
+      ${dateCol ? `TRY_CAST(${qi(dateCol)} AS TIMESTAMP)` : "NULL"} AS ts,
+      ${qtyCol ? `TRY_CAST(${qi(qtyCol)} AS DOUBLE)` : "NULL"} AS quantity,
+      ${priceCol ? `TRY_CAST(${qi(priceCol)} AS DOUBLE)` : "NULL"} AS price,
+      ${mapping.channel ? qi(mapping.channel) : "NULL"} AS channel,
+      ${mapping.city ? qi(mapping.city) : "NULL"} AS city,
+      ${mapping.state ? qi(mapping.state) : "NULL"} AS state,
+      ${mapping.zip ? qi(mapping.zip) : "NULL"} AS zip,
       ${revenueExpr} AS revenue
     FROM data;
   `;
