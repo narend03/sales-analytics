@@ -2,6 +2,45 @@ This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-
 
 ## Getting Started
 
+### Requirements
+
+- Node.js 20.x (installed via Homebrew or nvm)
+- npm/yarn/pnpm (npm is used below)
+- An [OpenAI API key](https://platform.openai.com/docs/api-reference/authentication) stored in `.env.local`
+- DuckDB WASM assets (`public/duckdb/duckdb-*`) are already self-hosted inside the repo
+ 
+### Bootstrapping
+
+1. Install dependencies and the DuckDB peer (`apache-arrow` is required by `@duckdb/duckdb-wasm`):
+
+```bash
+npm install
+npm install apache-arrow
+```
+
+2. Create `.env.local` and add the following values:
+
+```bash
+OPENAI_API_KEY=sk-...
+NEXT_PUBLIC_ENABLE_LLM=true
+```
+
+3. (Optional) If you prefer yarn/pnpm, run the equivalent install commands before the steps below.
+
+### Development
+
+```bash
+npm run dev -- --hostname 0.0.0.0 --port 3000
+```
+
+The app listens on `http://localhost:3000`. The page automatically reloads after edits.
+
+### Key Flows
+
+- Upload a CSV via the “Choose CSV” button, wait for DuckDB WASM to infer the schema, then click **Run** to materialize aggregates and insights.
+- The left-hand **History** panel will save each aggregated upload. Click an entry to reload its dashboard, or use **Delete** to remove just that snapshot.
+- Local storage keys (`upload-history-v1`, `upload-cache-v1:<hash>`, `upload-last-session`) mirror what you see in the UI for persistence troubleshooting.
+
 First, run the development server:
 
 ```bash
