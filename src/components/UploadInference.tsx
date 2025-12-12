@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useMemo, useState, useDeferredValue, useCallback, useRef } from "react";
+import { memo, useMemo, useState, useDeferredValue, useCallback, useRef, useEffect } from "react";
 import { AsyncDuckDB, AsyncDuckDBConnection, ConsoleLogger } from "@duckdb/duckdb-wasm";
 import { CanonicalField, SchemaInferenceResult } from "@/lib/contracts";
 import {
@@ -22,6 +22,8 @@ const bundleOverride = {
 const MAX_COLUMNS = 200;
 const MAX_STRING_LEN = 120;
 const CACHE_PREFIX = "upload-cache-v1";
+const HISTORY_KEY = "upload-history-v1";
+const LAST_SESSION_KEY = "upload-last-session";
 const LLM_ENABLED =
   typeof process !== "undefined"
     ? process.env.NEXT_PUBLIC_ENABLE_LLM !== "false"
@@ -53,6 +55,14 @@ type CachePayload = {
   agg?: AggregateResult | null;
   insights?: string[] | null;
   lastRefreshed?: string | null;
+  chatMessages?: ChatMessage[];
+};
+
+type HistoryEntry = {
+  hash: string;
+  title: string;
+  rowCount: number;
+  lastRefreshed?: string | null;
 };
 
 type ChatMessage = {
@@ -81,6 +91,100 @@ export function UploadInference() {
   const [lastRefreshed, setLastRefreshed] = useState<string | null>(null);
   const [fileHash, setFileHash] = useState<string | null>(null);
   const [cacheHit, setCacheHit] = useState(false);
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [selectedHash, setSelectedHash] = useState<string | null>(null);
+  const [titleInput, setTitleInput] = useState<string>("");
+  const sortedHistory = useMemo(() => {
+    return [...history].sort((a, b) => {
+      const aTime = a.lastRefreshed ? new Date(a.lastRefreshed).getTime() : 0;
+      const bTime = b.lastRefreshed ? new Date(b.lastRefreshed).getTime() : 0;
+      if (bTime !== aTime) return bTime - aTime;
+      return (b.rowCount ?? 0) - (a.rowCount ?? 0);
+    });
+  }, [history]);
+
+  const persistSession = useCallback(
+    (payload: Partial<CachePayload>) => {
+      if (!fileHash) return;
+      console.info("[persistSession]", fileHash, payload);
+      saveCache(fileHash, payload);
+      saveLastSession(fileHash);
+    },
+    [fileHash],
+  );
+
+  const updateHistoryEntry = useCallback(
+    (hash: string, overrides: Partial<HistoryEntry>) => {
+      setHistory((current) => {
+        const existing = current.find((entry) => entry.hash === hash);
+        const rowCount = Number(overrides.rowCount ?? existing?.rowCount ?? 0);
+        const title = overrides.title ?? existing?.title ?? hash;
+        const lastRefreshed = overrides.lastRefreshed ?? existing?.lastRefreshed ?? null;
+        const nextEntry: HistoryEntry = { hash, title, rowCount, lastRefreshed };
+        console.info("[history entry]", nextEntry);
+        const next = upsertHistoryEntry(current, nextEntry);
+        saveHistoryEntries(next);
+        return next;
+      });
+    },
+    [],
+  );
+
+  const handleTitleChange = useCallback(
+    (value: string) => {
+      setTitleInput(value);
+      if (fileHash) {
+        updateHistoryEntry(fileHash, { title: value });
+      }
+    },
+    [fileHash, updateHistoryEntry],
+  );
+
+  const restoreFromHistory = useCallback(
+    (entry: HistoryEntry) => {
+      const cached = loadCache(entry.hash);
+      console.info("[restoreFromHistory]", entry.hash, !!cached);
+      if (!cached) return;
+      setCacheHit(true);
+      setFileHash(entry.hash);
+      setResult(cached.result);
+      setAgg(cached.agg ?? null);
+      setAggView(cached.agg ?? null);
+      setInsights(cached.insights ?? null);
+      setChatMessages(cached.chatMessages ?? []);
+      setLastRefreshed(entry.lastRefreshed ?? cached.lastRefreshed ?? null);
+      setSelectedHash(entry.hash);
+      setTitleInput(entry.title);
+      updateHistoryEntry(entry.hash, {
+        title: entry.title,
+        lastRefreshed: entry.lastRefreshed ?? cached.lastRefreshed ?? null,
+      });
+      saveLastSession(entry.hash);
+    },
+    [updateHistoryEntry],
+  );
+
+  const clearHistory = useCallback(() => {
+    if (typeof window === "undefined") return;
+    localStorage.removeItem(HISTORY_KEY);
+    localStorage.removeItem(LAST_SESSION_KEY);
+    setHistory([]);
+    setSelectedHash(null);
+  }, []);
+  const deleteHistoryEntry = useCallback((hash: string) => {
+    if (typeof window === "undefined") return;
+    localStorage.removeItem(`${CACHE_PREFIX}:${hash}`);
+    setHistory((current) => {
+      const next = current.filter((entry) => entry.hash !== hash);
+      saveHistoryEntries(next);
+      return next;
+    });
+    setSelectedHash((prev) => (prev === hash ? null : prev));
+    const last = loadLastSession();
+    if (last?.hash === hash) {
+      localStorage.removeItem(LAST_SESSION_KEY);
+    }
+  }, []);
   const mappedColumns = useMemo(() => result?.schema.columns.filter((c) => c.canonicalName) ?? [], [result]);
   const mappedDistinctEntries = useMemo(() => {
     if (!result?.schema.distinctCounts) return [];
@@ -98,6 +202,30 @@ export function UploadInference() {
     () => (result ? JSON.stringify(result.previewRows, null, 2) : ""),
     [result],
   );
+
+  useEffect(() => {
+    const entries = loadHistoryEntries();
+    setHistory(entries);
+    const last = loadLastSession();
+    if (last?.hash) {
+      const cached = loadCache(last.hash);
+      if (cached) {
+        setCacheHit(true);
+        setFileHash(last.hash);
+        setResult(cached.result);
+        setAgg(cached.agg ?? null);
+        setAggView(cached.agg ?? null);
+        setInsights(cached.insights ?? null);
+        setChatMessages(cached.chatMessages ?? []);
+        setLastRefreshed(cached.lastRefreshed ?? null);
+        setSelectedHash(last.hash);
+        const matched = entries.find((entry) => entry.hash === last.hash);
+        if (matched) {
+          setTitleInput(matched.title);
+        }
+      }
+    }
+  }, []);
 
   const ensureDb = useMemo(
     () => async () => {
@@ -134,17 +262,28 @@ export function UploadInference() {
       const buf = new Uint8Array(bufArray);
       const hash = await sha256Hex(bufArray);
       setFileHash(hash);
+      setSelectedHash(hash);
       const cached = loadCache(hash);
       if (cached) {
         setCacheHit(true);
         setResult(cached.result);
         setAgg(cached.agg ?? null);
         setInsights(cached.insights ?? null);
+        setChatMessages(cached.chatMessages ?? []);
         setLastRefreshed(cached.lastRefreshed ?? null);
+        const existingHistory = history.find((entry) => entry.hash === hash);
+        const computedTitle = existingHistory?.title ?? file.name ?? hash;
+        setTitleInput(computedTitle);
+        updateHistoryEntry(hash, {
+          title: computedTitle,
+          lastRefreshed: cached.lastRefreshed ?? null,
+        });
+        saveLastSession(hash);
         setLoading(false);
         return;
       }
       setCacheHit(false);
+      setTitleInput(file.name ?? hash);
 
       const { db: duck, conn: connection } = await ensureDb();
       const filename = `upload_${Date.now()}.csv`;
@@ -225,6 +364,7 @@ export function UploadInference() {
       console.info("Ingestion summary", { rows: rowCount, columns: columns.length, mappings });
       setResult({ schema: response, previewRows });
       saveCache(hash, { result: { schema: response, previewRows } });
+      saveLastSession(hash);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Upload failed";
       setError(msg);
@@ -283,10 +423,24 @@ const runAggregates = async () => {
       setAggView(view);
       const refreshed = new Date().toISOString();
       setLastRefreshed(refreshed);
+      const insightsResult = await fetchInsights(view);
       if (fileHash) {
-        saveCache(fileHash, { result, agg: view, insights, lastRefreshed: refreshed });
+        persistSession({
+          result,
+          agg: view,
+          insights: insightsResult,
+          chatMessages,
+          lastRefreshed: refreshed,
+        });
+        const entry: HistoryEntry = {
+          hash: fileHash,
+          title: titleInput || history.find((h) => h.hash === fileHash)?.title || fileHash,
+          rowCount: Number(result.schema.rowCount ?? 0),
+          lastRefreshed: refreshed,
+        };
+        updateHistoryEntry(fileHash, entry);
+        setSelectedHash(fileHash);
       }
-      await fetchInsights(view);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Aggregations failed";
       setError(msg);
@@ -294,36 +448,43 @@ const runAggregates = async () => {
       setAggLoading(false);
     }
   };
-const fetchInsights = async (context: AggregateResult) => {
+const fetchInsights = async (context: AggregateResult): Promise<string[] | null> => {
     if (!LLM_ENABLED) {
       setInsightsError("LLM disabled (set NEXT_PUBLIC_ENABLE_LLM=true to enable).");
       setInsights([]);
-      return;
+      return [];
     }
+    setInsightsLoading(true);
+    setInsightsError(null);
+    setInsights(null);
+    const payload = buildInsightPayload(context);
     try {
-      setInsightsLoading(true);
-      setInsightsError(null);
-      setInsights(null);
-      const payload = buildInsightPayload(context);
       const payloadStr = JSON.stringify(payload);
       if (payloadStr.length > 4000) {
         setInsightsError("Context too large, skipped insights to save tokens.");
         setInsights([]);
-        return;
+        return [];
       }
       const res = await fetch("/api/insights", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+        body: payloadStr,
       });
       const data = await res.json();
       if (!res.ok) {
-        throw new Error(data.error || "insights error");
+        const errMsg = data?.error || "insights error";
+        setInsightsError(errMsg);
+        setInsights([]);
+        return [];
       }
-      setInsights(cleanInsights(data.insights));
+      const cleaned = cleanInsights(data.insights);
+      setInsights(cleaned);
+      return cleaned;
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "insights failed";
       setInsightsError(msg);
+      setInsights([]);
+      return [];
     } finally {
       setInsightsLoading(false);
     }
@@ -350,11 +511,17 @@ const runChat = async () => {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "chat error");
-      setChatMessages((prev) => [
-        ...prev,
-        { role: "user", content: chatInput.trim() },
-        { role: "assistant", content: data.answer, table: templateResult.table },
-      ]);
+      const userMessage: ChatMessage = { role: "user", content: chatInput.trim() };
+      const assistantMessage: ChatMessage = {
+        role: "assistant",
+        content: data.answer,
+        table: templateResult.table,
+      };
+      setChatMessages((prev) => {
+        const next = [...prev, userMessage, assistantMessage];
+        persistSession({ chatMessages: next });
+        return next;
+      });
       setChatInput("");
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "chat failed";
@@ -364,7 +531,75 @@ const runChat = async () => {
     }
   };
   return (
-    <div className="space-y-5">
+    <div className="grid gap-6 lg:grid-cols-[280px,1fr]">
+      <aside className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-semibold text-slate-900">History</h3>
+          <button
+            type="button"
+            onClick={clearHistory}
+            disabled={sortedHistory.length === 0}
+            className="text-[11px] font-semibold text-indigo-600 disabled:text-slate-400"
+          >
+            Clear
+          </button>
+        </div>
+        <div className="mt-3 space-y-2 max-h-[60vh] overflow-auto pr-1">
+          {sortedHistory.length === 0 ? (
+            <p className="text-xs text-gray-500">Upload a CSV to start saving snapshots.</p>
+          ) : (
+            sortedHistory.map((entry) => (
+              <div
+                key={entry.hash}
+                role="button"
+                tabIndex={0}
+                onClick={() => restoreFromHistory(entry)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    restoreFromHistory(entry);
+                  }
+                }}
+                className={`flex w-full cursor-pointer flex-col rounded-xl border px-3 py-2 shadow-sm transition ${
+                  selectedHash === entry.hash
+                    ? "border-indigo-400 bg-indigo-50"
+                    : "border-slate-200 bg-white hover:border-slate-400"
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-sm font-semibold text-slate-900 truncate">{entry.title}</span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-slate-500">{entry.rowCount} rows</span>
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        deleteHistoryEntry(entry.hash);
+                      }}
+                      className="text-[11px] font-semibold text-rose-600 hover:text-rose-800"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </div>
+                <p className="text-[10px] text-slate-500">
+                  {entry.lastRefreshed ? `Refreshed ${formatDateDisplay(entry.lastRefreshed)}` : "Run aggregates to save insights"}
+                </p>
+              </div>
+            ))
+          )}
+        </div>
+        <div className="mt-4 space-y-1">
+          <label className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Current title</label>
+          <input
+            value={titleInput}
+            onChange={(e) => handleTitleChange(e.target.value)}
+            placeholder="Describe this upload"
+            className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-indigo-500 focus:ring focus:ring-indigo-200"
+          />
+        </div>
+      </aside>
+      <div className="space-y-5">
       <div className="border-2 border-dashed border-slate-200 rounded-xl p-6 text-center shadow-sm bg-white">
         <div className="flex flex-col items-center gap-3">
           <input
@@ -621,6 +856,7 @@ const runChat = async () => {
         </div>
       )}
     </div>
+  </div>
   );
 }
 
@@ -643,12 +879,15 @@ function barWidth(value: number | null | undefined, rows?: { revenue: number }[]
   return `${Math.min(100, pct)}%`;
 }
 
-function saveCache(hash: string, data: CachePayload) {
+function saveCache(hash: string, data: Partial<CachePayload>) {
   if (typeof window === "undefined") return;
   try {
     const existing = loadCache(hash);
     const merged = { ...(existing ?? {}), ...data };
-    localStorage.setItem(`${CACHE_PREFIX}:${hash}`, JSON.stringify(merged));
+    const serialized = JSON.stringify(merged, (_key, value) =>
+      typeof value === "bigint" ? Number(value) : value,
+    );
+    localStorage.setItem(`${CACHE_PREFIX}:${hash}`, serialized);
   } catch (_) {
     // ignore cache failures
   }
@@ -663,6 +902,49 @@ function loadCache(hash: string): CachePayload | null {
   } catch (_) {
     return null;
   }
+}
+
+function loadHistoryEntries(): HistoryEntry[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    if (!raw) return [];
+    return JSON.parse(raw) as HistoryEntry[];
+  } catch (_) {
+    return [];
+  }
+}
+
+function saveHistoryEntries(entries: HistoryEntry[]) {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(entries));
+  } catch (_) {}
+}
+
+function upsertHistoryEntry(entries: HistoryEntry[], entry: HistoryEntry) {
+  const idx = entries.findIndex((e) => e.hash === entry.hash);
+  if (idx === -1) return [...entries, entry];
+  const copy = [...entries];
+  copy[idx] = { ...copy[idx], ...entry };
+  return copy;
+}
+
+function loadLastSession() {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(LAST_SESSION_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function saveLastSession(hash: string) {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(LAST_SESSION_KEY, JSON.stringify({ hash }));
+  } catch (_) {}
 }
 
 async function sha256Hex(buf: ArrayBuffer) {
